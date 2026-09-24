@@ -1,42 +1,38 @@
 # StreamFi Indexer
 
-Polls contract events into Postgres: an append-only raw log (`raw_events`) plus derived
-tables (`loan_proposals`, `treasury_proposals`) folded from that log.
+Tails Soroban `getEvents` and projects stream state into Postgres.
 
-This is scaffolding — the piece that's still missing is a real `EventSource`
-(`src/indexer/chainEventSource.ts`) wired to a live Soroban RPC endpoint. Everything
-around it (schema, cursor persistence, transaction boundaries, worker lifecycle) is real.
-
-## Setup
+## Run
 
 ```bash
-npm install
-cp .env.example .env   # set DATABASE_URL
-psql "$DATABASE_URL" -f db/schema.sql
-npm run dev             # or: npm run build && npm run start:worker
+# Migrations (replaces legacy `psql "$DATABASE_URL" -f db/schema.sql`)
+DATABASE_URL=postgres://user:pass@localhost:5432/streamfi npm run migrate
+# status / down
+DATABASE_URL=... npx tsx src/db/migrate.ts status
+DATABASE_URL=... npx tsx src/db/migrate.ts down
+
+# Worker (poll + HTTP)
+PORT=3000 START_LEDGER=1 POLL_INTERVAL_MS=5000 npm run start
+# or dev:
+npm run dev
 ```
 
-## Layout
+## Endpoints
 
-- `src/worker.ts` — process entry point; owns the pg pool and shuts it down on
-  SIGINT/SIGTERM.
-- `src/indexer/poller.ts` — read cursor → fetch page → ingest → save cursor loop.
-- `src/indexer/handlers.ts` — folds one decoded event into the derived tables.
-- `src/indexer/chainEventSource.ts` — the chain integration point (currently a stub).
-- `db/schema.sql` — `indexer_cursor`, `raw_events`, `loan_proposals`, `treasury_proposals`.
+- `GET /healthz` — `{ status: "ok"|"degraded", lastSuccessfulPollTimestamp, lastSuccessfulPollIso, currentCursor: { lastLedger, nextToken }, uptimeSeconds, version }`
+  Returns 200 when healthy, 503 when `lastSuccessfulPoll` is older than `HEALTHZ_STALE_MS` (default 5m). K8s `livenessProbe`/`readinessProbe` should hit this. `GET /readyz` is an alias.
+  Alternative signal: set `HEALTHZ_FILE=/tmp/indexer.ready` — worker touches the file on each successful poll; orchestrator can check `mtime`.
 
-## Known gaps
+- `GET /metrics` — Prometheus text format:
+  ```
+  indexer_pages_processed_total
+  indexer_events_folded_total
+  indexer_fold_failures_total
+  indexer_last_successful_poll_timestamp_seconds
+  indexer_current_cursor_ledger
+  ```
+  Counter triples (`pages_processed`, `events_folded`, `fold_failures`) are also emitted as structured JSON log lines on stderr (`msg=indexer_tick`) for dashboards without scraping.
 
-- **Single indexer instance** — no leader election or multi-instance coordination. Running
-  two `npm run start:worker` processes against the same database (e.g. an overlapping
-  rolling deploy) means both read the same cursor and both fold the same page.
-- **Non-idempotent derived-table folds** — `applyEvent` (`src/indexer/handlers.ts`) updates
-  `votes_for` / `votes_against` with increments, not idempotent upserts, and
-  `saveCursor` runs after `ingestPage` commits rather than in the same transaction
-  (`src/indexer/poller.ts`). A crash between those two steps, or a second worker
-  re-fetching an already-folded page, double-counts every vote in that page. The raw log
-  is unaffected (`ON CONFLICT (id) DO NOTHING`), but nothing records that an event was
-  already folded, so there's no way to detect or repair the drift after the fact short of
-  rebuilding the derived tables from `raw_events`.
+## Contract
 
-Both are tracked as follow-up work, not fixed as part of this scaffold.
+See `src/indexer/types.ts` for the `SorobanEventSource` pagination contract (`nextToken` opaque, `lastLedger` inclusive) and the expected `fields` shape per `ev.type`. That file is the entire interface between the poller and the event source implementation that will replace `StubSorobanEventSource`.
