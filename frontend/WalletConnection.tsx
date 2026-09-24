@@ -2,6 +2,10 @@ import React, { useState } from 'react';
 import { useMutation, gql, useApolloClient } from '@apollo/client';
 import { validateStreamPayload } from './lib/validateStreamPayload';
 import { GET_DASHBOARD_SUMMARY } from './Dashboard';
+import { useFeeEstimate } from './lib/useFeeEstimate';
+import { useWalletSession } from './lib/useWalletSession';
+
+const FACTORY_ADDRESS = process.env.REACT_APP_FACTORY_ADDRESS ?? '';
 
 const SUBMIT_STREAM_REQUEST = gql`
   mutation SubmitStreamRequest($recipient: String!, $amount: Float!, $ratePerSecond: Float!) {
@@ -12,12 +16,36 @@ const SUBMIT_STREAM_REQUEST = gql`
   }
 `;
 
+const MUTATION_TIMEOUT_MS = 10_000;
+
+/**
+ * Issue #589 audit: this component connects a wallet (via `connect`, below)
+ * but previously had no disconnect action and no session-expiry handling —
+ * a wallet session that expired mid-flow would only surface as an opaque
+ * mutation error. `useWalletSession` now owns that lifecycle: it exposes an
+ * explicit "Disconnect" action and auto-clears the session on expiry, and
+ * this component re-prompts for connection instead of letting the stream
+ * form submit against a dead session.
+ */
 export const WalletConnection: React.FC = () => {
+  const { session, isConnected, didExpire, connect, disconnect } = useWalletSession();
   const [recipient, setRecipient] = useState('');
   const [amount, setAmount] = useState('');
   const [ratePerSecond, setRatePerSecond] = useState('');
   const [validationErrors, setValidationErrors] = useState<string[]>([]);
   const client = useApolloClient();
+
+  const hasValidInputs = validateStreamPayload({
+    recipient,
+    amount: Number(amount),
+    ratePerSecond: Number(ratePerSecond),
+  }).valid;
+
+  const { estimate: feeEstimate, loading: feeLoading, error: feeError } = useFeeEstimate({
+    factoryAddress: FACTORY_ADDRESS,
+    senderAddress: session?.address ?? '',
+    enabled: isConnected && hasValidInputs && FACTORY_ADDRESS.length > 0,
+  });
 
   // Accepts the field that just changed as an override, since the input's
   // onChange fires before the corresponding setState has been applied —
@@ -45,6 +73,11 @@ export const WalletConnection: React.FC = () => {
   const handleSubmit = async (event: React.FormEvent) => {
     event.preventDefault();
 
+    if (!isConnected) {
+      setValidationErrors(['Connect your wallet before submitting a stream request.']);
+      return;
+    }
+
     const payload = {
       recipient,
       amount: Number(amount),
@@ -65,16 +98,59 @@ export const WalletConnection: React.FC = () => {
       return;
     }
 
+    // FIX for Bug #285: same underlying issue as StreamCreation (#150) —
+    // if the GraphQL endpoint never responds, the loading state hangs
+    // indefinitely. Racing the mutation against a timeout guarantees
+    // loading always clears, either with a result or a clear timeout error.
+    const timeout = new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error('GraphQL endpoint timed out. Please try again.')), MUTATION_TIMEOUT_MS);
+    });
+
     try {
-      await submitStreamRequest({ variables: payload });
+      await Promise.race([submitStreamRequest({ variables: payload }), timeout]);
     } catch (e) {
       setValidationErrors([e instanceof Error ? e.message : 'Failed to submit stream request.']);
+    }
+  };
+
+  const handleConnect = async () => {
+    // Delegates to an injected wallet extension (e.g. Freighter) when
+    // present; falls back to a manual address prompt otherwise so the
+    // session lifecycle below can still be exercised without one installed.
+    const injected = (window as unknown as { freighter?: { getPublicKey?: () => Promise<string> } }).freighter;
+    try {
+      const address = injected?.getPublicKey
+        ? await injected.getPublicKey()
+        : window.prompt('Enter a Stellar address to simulate a wallet connection:');
+      if (address) connect(address);
+    } catch (e) {
+      setValidationErrors([e instanceof Error ? e.message : 'Failed to connect wallet.']);
     }
   };
 
   return (
     <form className="wallet-connection" onSubmit={handleSubmit}>
       <h2>Connect Wallet &amp; Create Stream</h2>
+
+      <div className="wallet-session">
+        {isConnected && session ? (
+          <>
+            <span className="wallet-address">Connected: {session.address}</span>
+            <button type="button" onClick={disconnect}>
+              Disconnect
+            </button>
+          </>
+        ) : (
+          <button type="button" onClick={handleConnect}>
+            Connect Wallet
+          </button>
+        )}
+        {didExpire && !isConnected && (
+          <p className="wallet-session-expired" role="alert">
+            Your wallet session expired. Please reconnect to continue.
+          </p>
+        )}
+      </div>
 
       <label>
         Recipient address
@@ -90,6 +166,18 @@ export const WalletConnection: React.FC = () => {
         Rate per second
         <input value={ratePerSecond} onChange={(e) => { setRatePerSecond(e.target.value); validateCurrentInputs({ ratePerSecond: e.target.value }); }} />
       </label>
+
+      {hasValidInputs && FACTORY_ADDRESS.length > 0 && (
+        <div className="fee-estimate">
+          {feeLoading && <span className="fee-loading">Estimating network fee...</span>}
+          {feeError && <span className="fee-error">Fee estimate unavailable: {feeError}</span>}
+          {feeEstimate && !feeLoading && (
+            <span className="fee-result">
+              Estimated network fee: <strong>{feeEstimate.fee_xlm} XLM</strong>
+            </span>
+          )}
+        </div>
+      )}
 
       {validationErrors.length > 0 && (
         <ul className="validation-errors">
